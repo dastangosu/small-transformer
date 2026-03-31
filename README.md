@@ -51,31 +51,8 @@ Core components implemented in `model.py`:
 - `gradient_clipping`
 - `save_checkpoint` / `load_checkpoint`
 
-## Project Structure
 
-- `model.py`: model and training primitives
-- `train.py`: tokenization cache build + training
-- `decode.py`: checkpoint loading + generation
-- `tokenizer/bpe_tokenizer.py`: tokenizer wrapper
-- `tokenizer/train_tokenizer.py`: tokenizer training entrypoint
 
-## Environment
-
-Tested on Apple Silicon (`mps`) and CPU.
-
-Dependencies:
-
-- `torch`
-- `numpy`
-- `tokenizers`
-
-Example setup:
-
-```bash
-conda create -n llm python=3.12 -y
-conda activate llm
-pip install torch numpy tokenizers
-```
 
 ## How To Run
 
@@ -170,6 +147,23 @@ Decoding supports:
   - `outputs/checkpoints_archive/run_YYYYMMDD_HHMMSS/`
 
 This lets you start a fresh run without losing older models.
+
+## Flash Attention (Triton) Note
+
+This project includes a Triton Flash Attention implementation in `flash_attention_triton.py`.
+
+- It is enabled by setting `ATTENTION_IMPL="triton"` in `train.py`.
+- If Triton is unavailable (or CUDA is not used), the code safely falls back to the naive attention path.
+- This makes it easy to compare speed while keeping training behavior and model shape the same.
+
+## RTX 2060 Quick Experiment (Naive vs Triton)
+
+I ran the same training setup on an RTX 2060 with both attention backends:
+
+- Triton (`ATTENTION_IMPL="triton"`): final time ~`7.63` min, final valid loss ~`2.3370`
+- Naive (`ATTENTION_IMPL="naive"`): final time ~`9.17` min, final valid loss ~`2.3315`
+
+Brief summary: Triton was about `1.2x` faster (~20% faster wall-clock) with very similar final loss.
 
 ## Results Snapshot
 

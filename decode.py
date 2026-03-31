@@ -9,13 +9,14 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 TOKENIZER_PATH = os.path.join(ROOT, "outputs", "tokenizer", "tinystories_tokenizer.json")
 CHECKPOINT_PATH = os.path.join(ROOT, "outputs", "checkpoints", "ckpt_final.pt")
 
-# must match the model that produced CHECKPOINT_PATH.
+# must match the model that produced CHECKPOINT_PATH!!
 CONTEXT_LENGTH = 256
 NUM_LAYERS = 4
 D_MODEL = 256
 NUM_HEADS = 8
 D_FF = 1024
 ROPE_THETA = 10000.0
+ATTENTION_IMPL = "naive"  # edit this: "naive" | "triton"
 
 DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -88,12 +89,14 @@ def build_model(vocab_size: int) -> TransformerLM:
         d_model=D_MODEL,
         num_heads=NUM_HEADS,
         d_ff=D_FF,
+        attention_impl=ATTENTION_IMPL,
     ).to(DEVICE)
 
 
 def main():
     tokenizer = BPETokenizer.load(TOKENIZER_PATH)
     model = build_model(tokenizer.vocab_size)
+    print(f"Device: {DEVICE} | Attention impl: {ATTENTION_IMPL}")
     load_checkpoint(CHECKPOINT_PATH, model)
     model.eval()
 

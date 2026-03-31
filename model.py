@@ -2,6 +2,12 @@ import torch
 import torch.nn as nn 
 from torch.optim import Optimizer
 import math
+import os
+
+from flash_attention_triton import (
+    flash_attention_forward,
+    is_triton_flash_attention_available,
+)
 
 class Linear(nn.Module):
     def __init__(self, in_features, out_features, device=None, dtype=None):
@@ -101,16 +107,28 @@ def scaled_dot_product_attention(Q: torch.Tensor, K:torch.Tensor, V: torch.Tenso
     
 
 class MHA_with_RoPE(nn.Module):
-    def __init__(self, d_model: int, num_heads: int):
+    def __init__(self, d_model: int, num_heads: int, attention_impl: str = "naive"):
         super().__init__()
         self.query = Linear(d_model,d_model)
         self.key = Linear(d_model,d_model)
         self.value  = Linear(d_model,d_model)
         self.proj = Linear(d_model,d_model)
         self.num_heads = num_heads
+        if attention_impl not in {"naive", "triton"}:
+            raise ValueError("attention_impl must be one of: naive, triton")
+        self.attention_impl = attention_impl
+        self._attention_debug = os.getenv("ATTENTION_DEBUG", "0") == "1"
+        self._attention_debug_printed = False
         self._rope = None
         self._rope_theta = None
         self._rope_max_seq_len = None
+
+    @staticmethod
+    def _naive_causal_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
+        T = Q.shape[-2]
+        tril = torch.tril(torch.ones(T, T, device=Q.device))
+        mask = tril == 1
+        return scaled_dot_product_attention(Q, K, V, mask)
 
     def forward(self,x:torch.Tensor, theta: float, max_seq_len: int, token_positions:torch.Tensor = None):
         B,T,d_model = x.shape
@@ -125,7 +143,7 @@ class MHA_with_RoPE(nn.Module):
             or self._rope_max_seq_len != max_seq_len
             or self._rope.sin.device != x.device
         ):
-            # Keep RoPE cache out of state_dict (it is a runtime cache, not trainable state).
+            # Keep RoPE cache out of state_dict (it is a runtime cache, not trainable state)
             object.__setattr__(self, "_rope", RoPE(theta, d_model//num_heads, max_seq_len).to(x.device))
             self._rope_theta = theta
             self._rope_max_seq_len = max_seq_len
@@ -137,17 +155,36 @@ class MHA_with_RoPE(nn.Module):
         Q = rope(Q,token_positions)
         K = rope(K,token_positions)
 
-        tril = torch.tril(torch.ones(T, T, device=x.device))
-        mask = tril == 1
+        use_triton = (
+            self.attention_impl == "triton"
+            and is_triton_flash_attention_available()
+            and x.is_cuda
+        )
 
-        attention = scaled_dot_product_attention(Q,K,V,mask)
+        if use_triton:
+            input_dtype = Q.dtype
+            if input_dtype != torch.float16:
+                Q = Q.to(torch.float16)
+                K = K.to(torch.float16)
+                V = V.to(torch.float16)
+            attention = flash_attention_forward(Q, K, V, causal=True)
+            if attention.dtype != input_dtype:
+                attention = attention.to(input_dtype)
+        else:
+            attention = self._naive_causal_attention(Q, K, V)
+
+        if self._attention_debug and not self._attention_debug_printed:
+            backend = "triton" if use_triton else "naive-fallback"
+            print(f"[MHA_with_RoPE] attention backend={backend}")
+            self._attention_debug_printed = True
+
         attention = attention.transpose(1,2).reshape(B,T,d_model)
         return self.proj(attention)
     
 class TransformerBlock(nn.Module):
-    def __init__(self,d_model:int, num_heads: int, d_ff: int):
+    def __init__(self,d_model:int, num_heads: int, d_ff: int, attention_impl: str = "naive"):
         super().__init__()
-        self.mha = MHA_with_RoPE(d_model, num_heads)
+        self.mha = MHA_with_RoPE(d_model, num_heads, attention_impl=attention_impl)
         self.ffn = FFN_swiglu(d_model, d_ff)
         self.rmsnorm1 = RMSNorm(d_model)
         self.rmsnorm2 = RMSNorm(d_model)
@@ -159,10 +196,20 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerLM(nn.Module):
-    def __init__(self, vocab_size, context_length, num_layers, d_model, num_heads, d_ff):
+    def __init__(self, vocab_size, context_length, num_layers, d_model, num_heads, d_ff, attention_impl: str = "naive"):
         super().__init__()
         self.embedding = Embedding(vocab_size, d_model)
-        self.blocks = nn.ModuleList([TransformerBlock(d_model, num_heads, d_ff) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model,
+                    num_heads,
+                    d_ff,
+                    attention_impl=attention_impl,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.rmsnorm = RMSNorm(d_model)
         self.lmhead = Linear(d_model,vocab_size)
         self.context_length = context_length
@@ -288,7 +335,7 @@ def save_checkpoint(model, optimizer, iteration, out):
 def load_checkpoint(src, model, optimizer=None):
     checkpoint = torch.load(src, map_location=next(model.parameters()).device)
 
-    # backward compatibility: older checkpoints may include cached RoPE buffers.
+    # backward compatibility: older checkpoints may include cached RoPE buffers
     model_state = {
         k: v
         for k, v in checkpoint["model_state"].items()
@@ -297,7 +344,7 @@ def load_checkpoint(src, model, optimizer=None):
 
     model.load_state_dict(model_state)
 
-    # Optimizer state is optional (e.g. inference-only checkpoints).
+    # optimizer state is optional (e.g. inference-only checkpoints)
     if optimizer is not None:
         if "optimizer_state" not in checkpoint:
             raise KeyError("Checkpoint does not contain 'optimizer_state'")

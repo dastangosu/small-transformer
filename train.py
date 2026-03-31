@@ -38,6 +38,7 @@ D_MODEL = 256
 NUM_HEADS = 8
 D_FF = 1024
 ROPE_THETA = 10000.0
+ATTENTION_IMPL = "triton"  # edit this: "naive" | "triton"
 
 MAX_STEPS = 5000
 EVAL_EVERY = 100
@@ -49,6 +50,7 @@ MIN_LR = 3e-5
 WARMUP_STEPS = 200
 CLIP_NORM = 1.0
 WEIGHT_DECAY = 0.1
+SEED = 42
 
 # set to a checkpoint path to resume, or keep None to train from scratch.
 RESUME_PATH = None
@@ -144,9 +146,12 @@ def estimate_loss(model, token_ids, theta: float):
 
 
 def main():
-    torch.manual_seed(42)
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
-    # If starting a fresh run, archive old checkpoints to avoid overwriting.
+    # If starting a fresh run, archive old checkpoints to avoid overwriting
     if RESUME_PATH is None and os.path.isdir(CHECKPOINT_DIR):
         existing = [f for f in os.listdir(CHECKPOINT_DIR) if f.endswith(".pt")]
         if existing:
@@ -173,6 +178,7 @@ def main():
         d_model=D_MODEL,
         num_heads=NUM_HEADS,
         d_ff=D_FF,
+        attention_impl=ATTENTION_IMPL,
     ).to(DEVICE)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -186,6 +192,8 @@ def main():
         print(f"Resumed from: {RESUME_PATH} (next step: {start_step})")
 
     print(f"Device: {DEVICE}")
+    print(f"Seed: {SEED}")
+    print(f"Attention impl: {ATTENTION_IMPL}")
     print(f"Params: total={total_params:,} | trainable={trainable_params:,}")
     print(f"Train tokens: {len(train_ids):,} | Validation tokens: {len(valid_ids):,}")
 
